@@ -288,3 +288,9 @@ DETAIL_MOCK_DATA = {
 }
 
 URL_MOCK_DATA = ("https://bk.monitor.com/k8s-new/?=bcs_cluster_id=BCS-K8S-90001&namespace=xxx",)
+
+DIMENSION_DISTINCT_VALUE = 0
+
+BK_BIZ_ID_DEFAULT_TABLE_IDS = {"system_event", "gse_system_event"}
+
+BK_BIZ_ID = "bk_biz_id"
