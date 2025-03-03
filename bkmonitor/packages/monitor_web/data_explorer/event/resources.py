@@ -35,6 +35,7 @@ from .constants import (
     CategoryWeight,
     EventCategory,
     EventDimensionTypeEnum,
+    QueryMethod,
 )
 from .core.processors import BaseEventProcessor, OriginEventProcessor
 from .mock_data import (
@@ -264,7 +265,7 @@ class EventTopKResource(Resource):
             """
             计算事件源 topk 查询
             """
-            field_value_count_dict_list = _execute_single_query(config, field, "COUNT", limit, True)
+            field_value_count_dict_list = _execute_single_query(config, field, QueryMethod.COUNT.value, limit, True)
             for field_value_count_dict in field_value_count_dict_list:
                 topk_field_value_map.setdefault(field, {})[field_value_count_dict[field]] = (
                     topk_field_value_map.get(field, {}).get(field_value_count_dict[field], 0)
@@ -292,7 +293,7 @@ class EventTopKResource(Resource):
             计算数据源的维度去重数量
             """
             try:
-                count = _execute_single_query(config, field, "cardinality", None, False)[0]["_result_"]
+                count = _execute_single_query(config, field, QueryMethod.CARDINALITY.value, None, False)[0]["_result_"]
                 field_distinct_count_for_query_config.setdefault(field, []).append({"config": config, "count": count})
             except (IndexError, KeyError) as exc:
                 logger.warning("[EventTopkResource] failed to get field distinct_count, err -> %s", exc)
@@ -344,9 +345,10 @@ class EventTopKResource(Resource):
                 _compute_multiple_tables_distinct_count(field, matching_configs, field_distinct_count_for_query_config)
             else:
                 # 单事件源，直接计算去重数量，获取第一个匹配的配置
-                config = matching_configs[0]
                 try:
-                    count = _execute_single_query(config, field, "cardinality", None, False)[0]["_result_"]
+                    count = _execute_single_query(
+                        matching_configs[0], field, QueryMethod.CARDINALITY.value, None, False
+                    )[0]["_result_"]
                     topk_field_map[field]["distinct_count"] = count
                 except (IndexError, KeyError) as exc:
                     logger.warning("[EventTopkResource] failed to get distinct_count, err -> %s", exc)
