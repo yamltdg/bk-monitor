@@ -291,15 +291,10 @@ URL_MOCK_DATA = ("https://bk.monitor.com/k8s-new/?=bcs_cluster_id=BCS-K8S-90001&
 
 DIMENSION_DISTINCT_VALUE = 0
 
-BK_BIZ_ID_DEFAULT_TABLE_IDS = {"system_event", "gse_system_event"}
+BK_BIZ_ID_DEFAULT_TABLE_ID = "gse_system_event"
+
+BK_BIZ_ID_DEFAULT_DATA_LABEL = "system_event"
+
+MUTIL_QUERY_DEFAULT_LIMIT = 10000
 
 BK_BIZ_ID = "bk_biz_id"
-
-
-class QueryMethod(Enum):
-    """
-    查询方法枚举
-    """
-
-    CARDINALITY: str = "cardinality"
-    COUNT: str = "COUNT"

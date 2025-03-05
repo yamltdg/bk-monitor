@@ -10,7 +10,8 @@ specific language governing permissions and limitations under the License.
 """
 import logging
 import string
-from typing import Any, Dict, List, Tuple
+from collections import defaultdict
+from typing import Any, Dict, List, Set, Tuple
 
 from django.utils.translation import gettext_lazy as _
 
@@ -23,7 +24,8 @@ from metadata.models import ResultTable
 from . import serializers
 from .constants import (
     BK_BIZ_ID,
-    BK_BIZ_ID_DEFAULT_TABLE_IDS,
+    BK_BIZ_ID_DEFAULT_DATA_LABEL,
+    BK_BIZ_ID_DEFAULT_TABLE_ID,
     CATEGORY_WEIGHTS,
     DEFAULT_DIMENSION_FIELDS,
     DIMENSION_DISTINCT_VALUE,
@@ -31,11 +33,11 @@ from .constants import (
     ENTITIES,
     EVENT_FIELD_ALIAS,
     INNER_FIELD_TYPE_MAPPINGS,
+    MUTIL_QUERY_DEFAULT_LIMIT,
     TYPE_OPERATION_MAPPINGS,
     CategoryWeight,
     EventCategory,
     EventDimensionTypeEnum,
-    QueryMethod,
 )
 from .core.processors import BaseEventProcessor, OriginEventProcessor
 from .mock_data import (
@@ -128,8 +130,9 @@ class EventViewConfigResource(Resource):
             default_dimension_field: {"table_ids": set(), "data_labels": set()}
             for default_dimension_field in DEFAULT_DIMENSION_FIELDS
         }
-        dimension_metadata_map.setdefault(BK_BIZ_ID, {}).setdefault("table_ids", set()).update(
-            BK_BIZ_ID_DEFAULT_TABLE_IDS
+        dimension_metadata_map.setdefault(BK_BIZ_ID, {}).setdefault("table_ids", set()).add(BK_BIZ_ID_DEFAULT_TABLE_ID)
+        dimension_metadata_map.setdefault(BK_BIZ_ID, {}).setdefault("data_labels", set()).add(
+            BK_BIZ_ID_DEFAULT_DATA_LABEL
         )
 
         # 遍历查询集并聚合数据
@@ -221,142 +224,32 @@ class EventTopKResource(Resource):
         if validated_request_data["is_mock"]:
             return API_TOPK_RESPONSE
 
-        tables = [config["table"] for config in validated_request_data["query_configs"]]
+        queryset = (
+            UnifyQuerySet()
+            .scope(bk_biz_id=validated_request_data["bk_biz_id"])
+            .start_time(1000 * validated_request_data["start_time"])
+            .end_time(1000 * validated_request_data["end_time"])
+            .time_agg(False)
+            .instant()
+        )
+        query_configs = validated_request_data["query_configs"]
+        tables = [query_config["table"] for query_config in query_configs]
         dimension_metadata_map = EventViewConfigResource().get_dimension_metadata_map(tables)
-        field_distinct_count_for_query_config = {}
-        topk_field_value_map = {}
+        field_topk_map = defaultdict(lambda: defaultdict(int))
+        limit = validated_request_data["limit"]
+        fields = validated_request_data["fields"]
+        # 字段和对应的去重数字典
+        field_distinct_map = {}
+        # 不存在的 field 列表
+        missing_fields = []
+        # 存在的 field 的字典
         topk_field_map = {}
-
-        def _execute_single_query(config, field, method, limit, is_group_by):
-            """
-            处理单事件源查询
-            """
-            q = (
-                QueryConfigBuilder((config["data_type_label"], config["data_source_label"]))
-                .time_field("time")
-                .table(config["table"])
-                .metric(field=field, method=method)
-                .conditions(config["where"])
-            )
-            if is_group_by:
-                q = q.group_by(field)
-            # 构建统一查询集
-            queryset = (
-                UnifyQuerySet()
-                .scope(bk_biz_id=validated_request_data["bk_biz_id"])
-                .start_time(1000 * validated_request_data["start_time"])
-                .end_time(1000 * validated_request_data["end_time"])
-                .time_agg(False)
-                .instant()
-                .add_query(q)
-            )
-            try:
-                return list(queryset.limit(limit) if limit else queryset)
-            except Exception:
-                raise ValueError(_("事件数据拉取失败"))
-
-        def _get_matching_configs(field, query_configs):
-            """
-            获取字段匹配的查询条件
-            """
-            return [config for config in query_configs if config["table"] in dimension_metadata_map[field]["table_ids"]]
-
-        def _compute_topk(field, config, limit):
-            """
-            计算事件源 topk 查询
-            """
-            field_value_count_dict_list = _execute_single_query(config, field, QueryMethod.COUNT.value, limit, True)
-            for field_value_count_dict in field_value_count_dict_list:
-                topk_field_value_map.setdefault(field, {})[field_value_count_dict[field]] = (
-                    topk_field_value_map.get(field, {}).get(field_value_count_dict[field], 0)
-                    + field_value_count_dict["_result_"]
-                )
-
-        def _compute_topk_for_single_table(field, limit):
-            """
-            计算单事件源 topk 查询
-            """
-            if field in topk_field_value_map:
-                return
-            # 不存在 field 对应的元数据
-            if field not in dimension_metadata_map:
-                return
-
-            matching_configs = _get_matching_configs(field, validated_request_data["query_configs"])
-            # 不存在匹配的配置项
-            if not matching_configs:
-                return
-            _compute_topk(field, matching_configs[0], limit)
-
-        def _compute_distinct_count_for_table(field, config):
-            """
-            计算数据源的维度去重数量
-            """
-            try:
-                count = _execute_single_query(config, field, QueryMethod.CARDINALITY.value, None, False)[0]["_result_"]
-                field_distinct_count_for_query_config.setdefault(field, []).append({"config": config, "count": count})
-            except (IndexError, KeyError) as exc:
-                logger.warning("[EventTopkResource] failed to get field distinct_count, err -> %s", exc)
-                raise ValueError(_("维度去重数量拉取失败"))
-
-        def _compute_multiple_tables_distinct_count(
-            field: str, matching_configs: List[Dict[str, Any]], field_distinct_count_for_query_config
-        ):
-            """
-            获取多事件源的字段去重数量
-            """
-            run_threads(
-                [
-                    InheritParentThread(target=_compute_distinct_count_for_table, args=(field, config))
-                    for config in matching_configs
-                ]
-            )
-            run_threads(
-                [
-                    InheritParentThread(
-                        target=_compute_topk,
-                        args=(field, table_field_count["config"], table_field_count["count"]),
-                    )
-                    for table_field_count in field_distinct_count_for_query_config.get(field, [])
-                ]
-            )
-            topk_field_map[field]["distinct_count"] = len(topk_field_value_map.get(field))
-
-        def _compute_field_distinct_count(field):
-            """
-            计算维度去重数量
-            """
-            # 如果是内置字段，直接查询所有事件源
-            if field in INNER_FIELD_TYPE_MAPPINGS:
-                _compute_multiple_tables_distinct_count(
-                    field, validated_request_data["query_configs"], field_distinct_count_for_query_config
-                )
-                return
-            # 不存在 field 对应的元数据
-            if field not in dimension_metadata_map:
-                return
-
-                # 不存在匹配的配置项
-            matching_configs = _get_matching_configs(field, validated_request_data["query_configs"])
-            if not matching_configs:
-                return
-            # 多个事件源，需要查询每个事件源对应的枚举值去重计算
-            if len(matching_configs) > 1:
-                _compute_multiple_tables_distinct_count(field, matching_configs, field_distinct_count_for_query_config)
-            else:
-                # 单事件源，直接计算去重数量，获取第一个匹配的配置
-                try:
-                    count = _execute_single_query(
-                        matching_configs[0], field, QueryMethod.CARDINALITY.value, None, False
-                    )[0]["_result_"]
-                    topk_field_map[field]["distinct_count"] = count
-                except (IndexError, KeyError) as exc:
-                    logger.warning("[EventTopkResource] failed to get distinct_count, err -> %s", exc)
-                    raise ValueError(_("维度去重数量拉取失败"))
-
         # 初始化结果字典
-        for field in validated_request_data["fields"]:
-            topk_field_map[field] = {"field": field, "distinct_count": 0, "list": []}
+        for field in fields:
+            if field not in dimension_metadata_map:
+                # 删除不存在于元数据的字段，不参与后续的查询
+                fields.remove(field)
+                missing_fields.append({"field": field, "distinct_count": 0, "list": []})
 
         # 计算事件总数
         total = EventTotalResource().perform_request(validated_request_data)["total"]
@@ -366,32 +259,45 @@ class EventTopKResource(Resource):
         # 计算去重数量
         run_threads(
             [
-                InheritParentThread(target=_compute_field_distinct_count, args=(field,))
-                for field in validated_request_data["fields"]
+                InheritParentThread(
+                    target=self.calculate_field_distinct_count,
+                    args=(queryset, query_configs, field, dimension_metadata_map, field_distinct_map, field_topk_map),
+                )
+                for field in fields
             ]
         )
-
         # 只计算维度的去重数量，不需要 topk 值
-        if validated_request_data["limit"] == DIMENSION_DISTINCT_VALUE:
-            return list(topk_field_map.values())
+        if limit == DIMENSION_DISTINCT_VALUE:
+            for field in fields:
+                topk_field_map[field] = {
+                    "field": field,
+                    "distinct_count": field_distinct_map[field],
+                    "list": [],
+                }
+            # 合并不存在的字段
+            return list(topk_field_map.values()) + missing_fields
 
         # 计算 topk，因为已经计算了多事件源 topk 值，此处只需计算单事件源
-        run_threads(
-            [
-                InheritParentThread(
-                    target=_compute_topk_for_single_table, args=(field, validated_request_data["limit"])
-                )
-                for field in validated_request_data["fields"]
-            ]
-        )
+        thread_list = [
+            InheritParentThread(
+                target=self.calculate_topk,
+                args=(
+                    queryset,
+                    self.get_match_query_configs(field, query_configs, dimension_metadata_map)[0],  # 直接调用
+                    field,
+                    limit,
+                    field_topk_map,
+                ),
+            )
+            for field in fields
+        ]
+        run_threads(thread_list)
 
-        for field, field_values in topk_field_value_map.items():
-            sorted_fields = sorted(field_values.items(), key=lambda item: item[1], reverse=True)[
-                : validated_request_data["limit"]
-            ]
+        for field, field_values in field_topk_map.items():
+            sorted_fields = sorted(field_values.items(), key=lambda item: item[1], reverse=True)[:limit]
             topk_field_map[field] = {
                 "field": field,
-                "distinct_count": len(field_values),
+                "distinct_count": field_distinct_map[field],
                 "list": [
                     {
                         "value": field_value,
@@ -402,7 +308,110 @@ class EventTopKResource(Resource):
                     for field_value, field_count in sorted_fields
                 ],
             }
-        return list(topk_field_map.values())
+        return list(topk_field_map.values()) + missing_fields
+
+    @classmethod
+    def get_q(cls, query_config) -> QueryConfigBuilder:
+        # 基于 query_config 生成 QueryConfigBuilder
+        return (
+            (
+                QueryConfigBuilder((query_config["data_type_label"], query_config["data_source_label"])).time_field(
+                    "time"
+                )
+            )
+            .table(query_config["table"])
+            .conditions(query_config["where"])
+        )
+
+    @classmethod
+    def query_topk(cls, queryset: UnifyQuerySet, qs: List[QueryConfigBuilder], field: str, limit: int = 0):
+        for q in qs:
+            queryset = queryset.add_query(q.metric(field=field, method="COUNT").group_by(field).order_by("-_value"))
+        return list(queryset.limit(limit))
+
+    @classmethod
+    def query_distinct(cls, queryset: UnifyQuerySet, qs: List[QueryConfigBuilder], field: str):
+        for q in qs:
+            queryset = queryset.add_query(q.metric(field=field, method="cardinality"))
+        return list(queryset)
+
+    @classmethod
+    def get_match_query_configs(
+        cls, field: str, query_configs: List[Dict[str, Any]], dimension_metadata_map: Dict[str, Dict[str, Set[str]]]
+    ):
+        """
+        获取字段匹配的查询条件
+        """
+        if field not in dimension_metadata_map:
+            return []
+        return [
+            query_config
+            for query_config in query_configs
+            if query_config["table"] in dimension_metadata_map[field]["table_ids"]
+            or query_config["table"] in dimension_metadata_map[field]["data_labels"]
+        ]
+
+    @classmethod
+    def calculate_topk(
+        cls, queryset: UnifyQuerySet, query_config, field: str, limit: int, field_topk_map: Dict[str, Dict[str, int]]
+    ):
+        """
+        计算事件源 topk 查询
+        """
+        query = cls.get_q(query_config)
+        field_value_count_dict_list = cls.query_topk(queryset, [query], field, limit)
+        for field_value_count_dict in field_value_count_dict_list:
+            try:
+                field_topk_map[field][field_value_count_dict[field]] += field_value_count_dict["_result_"]
+            except (IndexError, KeyError) as exc:
+                logger.warning("[EventTopkResource] failed to get field topk, err -> %s", exc)
+                raise ValueError(_("获取字段的去重数量失败"))
+
+    @classmethod
+    def calculate_distinct_count_for_table(
+        cls, queryset: UnifyQuerySet, query_config: Dict[str, Any], field: str, field_distinct_map: Dict[str, int]
+    ):
+        """
+        计算数据源的维度去重数量
+        """
+        q = cls.get_q(query_config)
+        try:
+            field_distinct_map[field] = cls.query_distinct(queryset, [q], field)[0]["_result_"]
+        except (IndexError, KeyError) as exc:
+            logger.warning("[EventTopkResource] failed to get field distinct_count, err -> %s", exc)
+            raise ValueError(_("获取字段的去重数量失败"))
+
+    @classmethod
+    def calculate_field_distinct_count(
+        cls,
+        queryset: UnifyQuerySet,
+        query_configs: List[Dict[str, Any]],
+        field: str,
+        dimension_metadata_map: Dict[str, Dict[str, Set[str]]],
+        field_distinct_map: Dict[str, int],
+        field_topk_map: Dict[str, Dict[str, int]],
+    ):
+        """
+        计算维度去重数量
+        """
+        matching_configs = cls.get_match_query_configs(field, query_configs, dimension_metadata_map)
+        # 如果是内置字段，直接查询所有事件源
+        if field in INNER_FIELD_TYPE_MAPPINGS:
+            matching_configs = query_configs
+        if len(matching_configs) > 1:
+            # 多事件源直接求所有枚举值
+            run_threads(
+                [
+                    InheritParentThread(
+                        target=cls.calculate_topk,
+                        args=(queryset, query_config, field, MUTIL_QUERY_DEFAULT_LIMIT, field_topk_map),
+                    )
+                    for query_config in matching_configs
+                ]
+            )
+            field_distinct_map[field] = len(field_topk_map.get(field))
+        else:
+            cls.calculate_distinct_count_for_table(queryset, matching_configs[0], field, field_distinct_map)
 
 
 class EventTotalResource(Resource):
