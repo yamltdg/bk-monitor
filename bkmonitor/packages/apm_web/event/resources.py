@@ -195,7 +195,7 @@ class EventTagsResource(Resource):
         def update_aggregated_timeseries(event_domain, event_source, event_series):
             timestamp = event_series["time"]
             # 获取或创建当前时间戳的项
-            item = next(
+            tag_item = next(
                 (
                     item
                     for item in aggregated_timeseries[timestamp]
@@ -204,13 +204,13 @@ class EventTagsResource(Resource):
                 None,
             )
 
-            if not item:
+            if not tag_item:
                 item = {"domain": event_domain, "source": event_source, "count": 0, "statistics": defaultdict(int)}
                 aggregated_timeseries[timestamp].append(item)
             # 更新统计信息和总计数
-            item["count"] += event_series["value"]["count"]
+            tag_item["count"] += event_series["value"]["count"]
             for dimension_type, count in event_series["value"]["statistics"].items():
-                item["statistics"][dimension_type] += count
+                tag_item["statistics"][dimension_type] += count
 
         for (domain, source), timeseries in processed_timeseries.items():
             for datapoint in timeseries:
