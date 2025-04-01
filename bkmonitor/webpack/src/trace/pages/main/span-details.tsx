@@ -821,7 +821,9 @@ export default defineComponent({
               <span class='left'>
                 <span
                   class='left-title'
-                  v-bk-overflow-tips
+                  v-overflow-title={{
+                    type: 'tips',
+                  }}
                 >
                   {item.label}
                 </span>
